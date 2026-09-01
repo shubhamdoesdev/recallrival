@@ -1,9 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { DOTS, DOT_COUNT, type DotSpec } from "../lib/dots";
+import { buildOctagons, pointOnSide, octagonPoints } from "../lib/octagon";
 
 export type DotState = "idle" | "available" | "used" | "wrong";
+export type RingMode = "flat" | "pillars" | "octagons";
 
 const MESH_MIN_OPACITY = 0.03;
 const MESH_MAX_OPACITY = 0.16;
@@ -52,6 +54,45 @@ function visitRanks(trail: number[]): number[] {
   });
 }
 
+// --- Octagon mode ------------------------------------------------------------
+// Every dot is an actual octagon. Each of its 7 usable sides is permanently
+// dedicated to one specific other octagon (see lib/octagon.ts). When A and B
+// connect, the line runs between the midpoint of A's B-side and B's A-side —
+// not center to center. Retracing that exact connection again doesn't overlap
+// the old line: instead the side gets divided into that-many equal slots and
+// each retracing gets its own parallel line in its own slot, spread evenly
+// across the side's actual length. Brightness ramps per-connection (oldest
+// faint, newest full), not globally — it's about how worn THIS specific
+// connection is, not how far into the whole turn we are.
+const OCTAGON_RADIUS = 3.4; // viewBox units
+
+interface EdgeOccurrence {
+  key: string;
+  a: number;
+  b: number;
+  occurrenceIndex: number;
+  total: number;
+}
+
+function groupEdgeOccurrences(trail: number[]): EdgeOccurrence[] {
+  const raw: { key: string; a: number; b: number }[] = [];
+  for (let i = 0; i < trail.length - 1; i++) {
+    const a = trail[i];
+    const b = trail[i + 1];
+    if (a === b) continue;
+    const key = a < b ? `${a}-${b}` : `${b}-${a}`;
+    raw.push({ key, a, b });
+  }
+  const totals = new Map<string, number>();
+  raw.forEach((e) => totals.set(e.key, (totals.get(e.key) ?? 0) + 1));
+  const seenSoFar = new Map<string, number>();
+  return raw.map((e) => {
+    const occurrenceIndex = seenSoFar.get(e.key) ?? 0;
+    seenSoFar.set(e.key, occurrenceIndex + 1);
+    return { ...e, occurrenceIndex, total: totals.get(e.key)! };
+  });
+}
+
 interface DotRingProps {
   getDotState: (id: number) => DotState;
   onDotClick?: (id: number) => void;
@@ -60,8 +101,8 @@ interface DotRingProps {
   trail?: number[];
   wrongEdge?: { from: number; to: number } | null;
   center?: ReactNode;
-  /** Experimental: render the persistent trail as 3D-ish pillars instead of flat lines. */
-  pillars?: boolean;
+  /** Which persistent-trail visual to use. Defaults to the original flat gradient lines. */
+  mode?: RingMode;
 }
 
 export default function DotRing({
@@ -71,10 +112,15 @@ export default function DotRing({
   trail = [],
   wrongEdge = null,
   center,
-  pillars = false,
+  mode = "flat",
 }: DotRingProps) {
   const last = trail.length > 1 ? { from: trail[trail.length - 2], to: trail[trail.length - 1] } : null;
-  const ranks = pillars ? visitRanks(trail) : null;
+  const ranks = mode === "pillars" ? visitRanks(trail) : null;
+
+  const octagons = useMemo(() => buildOctagons(OCTAGON_RADIUS), []);
+  const octagonById = useMemo(() => new Map(octagons.map((o) => [o.id, o])), [octagons]);
+  const edgeOccurrences = mode === "octagons" ? groupEdgeOccurrences(trail) : [];
+  const lastOccurrence = edgeOccurrences.length > 0 ? edgeOccurrences[edgeOccurrences.length - 1] : null;
 
   // Track which dot should replay its tap-ripple: whenever a new dot lands
   // at the end of the trail, bump a nonce so that dot (and only that dot)
@@ -92,6 +138,27 @@ export default function DotRing({
     seenLast.current = newest;
   }, [trail]);
 
+  // In octagon mode, the transient directional arrow should start/end at the same slot points as
+  // the persistent line it's drawn on top of, not the raw dot centers.
+  let animatedFrom: { x: number; y: number } | null = null;
+  let animatedTo: { x: number; y: number } | null = null;
+  if (last) {
+    if (mode === "octagons" && lastOccurrence) {
+      const octA = octagonById.get(lastOccurrence.a)!;
+      const octB = octagonById.get(lastOccurrence.b)!;
+      const t = (lastOccurrence.occurrenceIndex + 0.5) / lastOccurrence.total;
+      const sideOnA = octA.neighborSide.get(lastOccurrence.b)!;
+      const sideOnB = octB.neighborSide.get(lastOccurrence.a)!;
+      const pA = pointOnSide(octA, sideOnA, t);
+      const pB = pointOnSide(octB, sideOnB, t);
+      animatedFrom = lastOccurrence.a === last.from ? pA : pB;
+      animatedTo = lastOccurrence.a === last.from ? pB : pA;
+    } else {
+      animatedFrom = DOTS[last.from];
+      animatedTo = DOTS[last.to];
+    }
+  }
+
   return (
     <div className="relative mx-auto aspect-square w-full max-w-[420px]">
       <svg viewBox="0 0 100 100" className="pointer-events-none absolute inset-0 h-full w-full overflow-visible">
@@ -104,7 +171,58 @@ export default function DotRing({
           </marker>
         </defs>
 
-        {pillars && ranks ? (
+        {mode === "octagons" ? (
+          <>
+            {/* The octagon nodes themselves, drawn here (not as HTML) since they need real polygon
+                geometry. The invisible tap buttons sit on top of these for hit-testing. */}
+            {octagons.map((oct) => {
+              const state = getDotState(oct.id);
+              const isWrong = state === "wrong";
+              const isLastTapped = trail.length > 0 && oct.id === trail[trail.length - 1];
+              const fillClass = isWrong ? "fill-red-600" : "fill-neutral-900 dark:fill-white";
+              return (
+                <polygon
+                  key={`oct-${oct.id}`}
+                  points={octagonPoints(oct)}
+                  className={`${fillClass} transition-opacity duration-200`}
+                  style={{ opacity: isLastTapped && !isWrong ? 0.4 : 1 }}
+                />
+              );
+            })}
+
+            {/* Every retracing of a connection gets its own parallel line, in its own equally-spaced
+                slot along the actual side shared with that neighbor. Oldest slot faintest, newest
+                slot brightest — and since a stable key is used per historical occurrence (not per
+                slot), existing lines smoothly slide into their new positions as N grows rather than
+                jumping, via the inline CSS transition below. */}
+            {edgeOccurrences.map((occ) => {
+              const octA = octagonById.get(occ.a)!;
+              const octB = octagonById.get(occ.b)!;
+              const sideOnA = octA.neighborSide.get(occ.b)!;
+              const sideOnB = octB.neighborSide.get(occ.a)!;
+              const t = (occ.occurrenceIndex + 0.5) / occ.total;
+              const pA = pointOnSide(octA, sideOnA, t);
+              const pB = pointOnSide(octB, sideOnB, t);
+              const opacity = MESH_MIN_OPACITY + (MESH_MAX_OPACITY - MESH_MIN_OPACITY) * ((occ.occurrenceIndex + 1) / occ.total);
+              return (
+                <line
+                  key={`edge-${occ.key}-occ${occ.occurrenceIndex}`}
+                  x1={pA.x}
+                  y1={pA.y}
+                  x2={pB.x}
+                  y2={pB.y}
+                  strokeWidth={0.35}
+                  strokeLinecap="round"
+                  style={{
+                    opacity,
+                    transition: "x1 300ms ease, y1 300ms ease, x2 300ms ease, y2 300ms ease, opacity 300ms ease",
+                  }}
+                  className="stroke-black dark:stroke-white"
+                />
+              );
+            })}
+          </>
+        ) : mode === "pillars" && ranks ? (
           <>
             {/* Pillars: a faint pole at every dot that's been touched, rising from its base up to
                 the height its tallest current visit level reaches. Background structure — drawn
@@ -203,12 +321,8 @@ export default function DotRing({
         )}
 
         {/* The hop that was just tapped: draws from the previous dot to the new one, then erases the same way. */}
-        {last && (
-          <AnimatedLine
-            key={`${last.from}-${last.to}-${trail.length}`}
-            from={DOTS[last.from]}
-            to={DOTS[last.to]}
-          />
+        {animatedFrom && animatedTo && (
+          <AnimatedLine key={`${last!.from}-${last!.to}-${trail.length}`} from={animatedFrom} to={animatedTo} />
         )}
 
         {/* A failed tap stays drawn permanently (game-over state), no erase. */}
@@ -229,11 +343,15 @@ export default function DotRing({
             style={{ left: `${dot.x}%`, top: `${dot.y}%` }}
             className="absolute grid h-16 w-16 -translate-x-1/2 -translate-y-1/2 touch-manipulation place-items-center rounded-full sm:h-[72px] sm:w-[72px]"
           >
-            <DotVisual
-              state={getDotState(dot.id)}
-              ripple={dot.id === pulse?.dotId ? pulse?.nonce : undefined}
-              faint={isLastTapped}
-            />
+            {mode === "octagons" ? (
+              <RippleOnly ripple={dot.id === pulse?.dotId ? pulse?.nonce : undefined} />
+            ) : (
+              <DotVisual
+                state={getDotState(dot.id)}
+                ripple={dot.id === pulse?.dotId ? pulse?.nonce : undefined}
+                faint={isLastTapped}
+              />
+            )}
           </button>
         );
       })}
@@ -260,8 +378,8 @@ function AnimatedLine({
   wrong = false,
   persist = false,
 }: {
-  from: DotSpec;
-  to: DotSpec;
+  from: { x: number; y: number };
+  to: { x: number; y: number };
   wrong?: boolean;
   persist?: boolean;
 }) {
@@ -304,7 +422,7 @@ function AnimatedLine({
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [from.id, to.id, persist, wrong]);
+  }, [from.x, from.y, to.x, to.y, persist, wrong]);
 
   if (progress >= 2) return null;
 
@@ -345,12 +463,7 @@ function AnimatedLine({
 const RIPPLE_GROW_MS = 150;
 const RIPPLE_SHRINK_MS = 280;
 
-/**
- * The tap feedback: a soft grey circle grows around the dot the instant it's
- * tapped, then shrinks back down to nothing shortly after — a ripple, not a
- * permanent marker. The dot itself always returns to its normal look.
- */
-function DotVisual({ state, ripple, faint = false }: { state: DotState; ripple?: number; faint?: boolean }) {
+function useRipplePhase(ripple?: number) {
   const [phase, setPhase] = useState<"idle" | "grow" | "shrink">("idle");
   const seenRipple = useRef<number | undefined>(undefined);
 
@@ -367,6 +480,29 @@ function DotVisual({ state, ripple, faint = false }: { state: DotState; ripple?:
     }
   }, [ripple]);
 
+  return phase;
+}
+
+/** Octagon mode: the octagon itself is drawn in the main SVG, so the button only needs the ripple. */
+function RippleOnly({ ripple }: { ripple?: number }) {
+  const phase = useRipplePhase(ripple);
+  const rippleClasses =
+    phase === "grow"
+      ? "scale-100 opacity-40 duration-150 ease-out"
+      : phase === "shrink"
+      ? "scale-0 opacity-0 duration-300 ease-in"
+      : "scale-0 opacity-0 duration-0";
+
+  return <span className={`h-11 w-11 rounded-full bg-neutral-300 transition-all dark:bg-neutral-600 ${rippleClasses}`} />;
+}
+
+/**
+ * The tap feedback: a soft grey circle grows around the dot the instant it's
+ * tapped, then shrinks back down to nothing shortly after — a ripple, not a
+ * permanent marker. The dot itself always returns to its normal look.
+ */
+function DotVisual({ state, ripple, faint = false }: { state: DotState; ripple?: number; faint?: boolean }) {
+  const phase = useRipplePhase(ripple);
   const isWrong = state === "wrong";
 
   const rippleClasses =
