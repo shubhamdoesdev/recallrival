@@ -42,6 +42,19 @@ function hueAt(fraction: number) {
 function spectrumColor(hue: number) {
   return `hsl(${hue}, 75%, 55%)`;
 }
+
+// A gradient with only a start and end stop interpolates in RGB space, not around the hue wheel —
+// a straight red-to-violet 2-stop gradient cuts directly through RGB and skips right past the
+// orange/yellow/green/blue/indigo bands instead of sweeping through them. Sampling several
+// in-between hues as explicit stops forces the gradient to actually pass through every band.
+const GRADIENT_SAMPLES = 20;
+
+function hueStops(hueStart: number, hueEnd: number) {
+  return Array.from({ length: GRADIENT_SAMPLES + 1 }, (_, i) => {
+    const t = i / GRADIENT_SAMPLES;
+    return { offset: `${t * 100}%`, color: spectrumColor(hueStart + (hueEnd - hueStart) * t) };
+  });
+}
 const RING_CENTER = { x: 50, y: 50 };
 
 interface Point {
@@ -88,6 +101,57 @@ function slotPoints(geo: EdgeGeometry, occurrenceIndex: number, total: number) {
     a: { x: geo.baseA.x + geo.perp.x * offset, y: geo.baseA.y + geo.perp.y * offset },
     b: { x: geo.baseB.x + geo.perp.x * offset, y: geo.baseB.y + geo.perp.y * offset },
   };
+}
+
+// A connection is drawn as a bent path, not a straight line: it starts at the CENTER of the origin
+// octagon, travels out through its assigned side (at that side's slot point), crosses straight to
+// the neighbor's assigned side (at ITS slot point), then bends inward to that octagon's center.
+// Multiple retracings of the same connection all share the same two center points and only fan out
+// at the slot points in between (still guaranteed parallel there — see slotPoints above), so at
+// each node it reads as several lines briefly converging to a single point before diverging again.
+function pathLength(points: Point[]): number {
+  let len = 0;
+  for (let i = 0; i < points.length - 1; i++) {
+    len += Math.hypot(points[i + 1].x - points[i].x, points[i + 1].y - points[i].y);
+  }
+  return len;
+}
+
+function pointAtFraction(points: Point[], t: number): Point {
+  const total = pathLength(points);
+  if (total === 0) return points[0];
+  let target = Math.max(0, Math.min(t, 1)) * total;
+  for (let i = 0; i < points.length - 1; i++) {
+    const segLen = Math.hypot(points[i + 1].x - points[i].x, points[i + 1].y - points[i].y);
+    if (target <= segLen || i === points.length - 2) {
+      const localT = segLen > 0 ? target / segLen : 0;
+      return {
+        x: points[i].x + (points[i + 1].x - points[i].x) * localT,
+        y: points[i].y + (points[i + 1].y - points[i].y) * localT,
+      };
+    }
+    target -= segLen;
+  }
+  return points[points.length - 1];
+}
+
+/** The visible portion of a bent path between fractions `fromT` and `toT`, keeping any bend point(s) in between. */
+function subPath(points: Point[], fromT: number, toT: number): Point[] {
+  const total = pathLength(points);
+  const fromD = Math.max(0, Math.min(fromT, 1)) * total;
+  const toD = Math.max(0, Math.min(toT, 1)) * total;
+  const result: Point[] = [pointAtFraction(points, fromT)];
+  let cum = 0;
+  for (let i = 0; i < points.length; i++) {
+    if (i > 0) cum += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+    if (cum > fromD && cum < toD) result.push(points[i]);
+  }
+  result.push(pointAtFraction(points, toT));
+  return result;
+}
+
+function pointsAttr(points: Point[]): string {
+  return points.map((p) => `${p.x},${p.y}`).join(" ");
 }
 
 interface EdgeOccurrence {
@@ -149,17 +213,30 @@ export default function DotRing({
   const totalHops = edgeOccurrences.length;
   const lastOccurrence = totalHops > 0 ? edgeOccurrences[totalHops - 1] : null;
 
-  // The transient directional arrow starts/ends at the same slot points as the persistent line
-  // it's drawn on top of, not the raw dot centers.
-  let animatedFrom: Point | null = null;
-  let animatedTo: Point | null = null;
+  // The transient directional arrow travels the same bent path (center -> side -> side -> center)
+  // as the persistent line it's drawn on top of, not a straight line between the raw slot points.
+  let animatedPath: Point[] | null = null;
   if (last && lastOccurrence) {
     const octA = octagonById.get(lastOccurrence.a)!;
     const octB = octagonById.get(lastOccurrence.b)!;
     const geo = computeEdgeGeometry(octA, octB);
     const { a: pA, b: pB } = slotPoints(geo, lastOccurrence.occurrenceIndex, lastOccurrence.total);
-    animatedFrom = lastOccurrence.a === last.from ? pA : pB;
-    animatedTo = lastOccurrence.a === last.from ? pB : pA;
+    const pFrom = lastOccurrence.a === last.from ? pA : pB;
+    const pTo = lastOccurrence.a === last.from ? pB : pA;
+    const centerFrom = lastOccurrence.a === last.from ? octA.center : octB.center;
+    const centerTo = lastOccurrence.a === last.from ? octB.center : octA.center;
+    animatedPath = [centerFrom, pFrom, pTo, centerTo];
+  }
+
+  // The game-over failure indicator gets the same bent-path treatment, using the dead-center of
+  // each side (no parallel offset — it's a one-off, not part of any retracing bundle).
+  let wrongPath: Point[] | null = null;
+  if (wrongEdge) {
+    const octFrom = octagonById.get(wrongEdge.from)!;
+    const octTo = octagonById.get(wrongEdge.to)!;
+    const geo = computeEdgeGeometry(octFrom, octTo);
+    const { a: pFrom, b: pTo } = slotPoints(geo, 0, 1);
+    wrongPath = [octFrom.center, pFrom, pTo, octTo.center];
   }
 
   return (
@@ -171,11 +248,59 @@ export default function DotRing({
           </marker>
         </defs>
 
-        {/* The octagon nodes themselves — real polygon geometry, drawn here rather than as HTML.
-            Outline only by default; the one that was just tapped (and is temporarily un-tappable
-            again until a different dot is chosen) fills in solid as the visual tie to that
-            lock — no separate ripple popup needed. The invisible tap buttons below sit on top of
-            these purely for hit-testing. */}
+        {/* Every retracing of a connection gets its own bent path, parallel to every other path on
+            that same connection where it crosses between the two octagons (guaranteed — see
+            computeEdgeGeometry/slotPoints above), pushed further toward the ring's outer edge the
+            more recent it is. Each path's own color is its slice of the single red -> violet
+            spectrum the whole trail shares (see the comment up top) — oriented in the actual
+            direction it was tapped, so within one path it's already shifting toward violet, and
+            the very last path's arrival end is always exactly violet. A stable key per historical
+            occurrence (not per slot) means existing paths smoothly slide to their new spatial
+            offset as a connection's retrace count grows — though note that's currently instant
+            rather than animated, since CSS transitions don't reliably animate a polyline's `points`
+            attribute the way they did the old straight `<line>`'s x1/y1/x2/y2. Driven entirely by
+            `trail`, so it goes blank the instant a screen clears `trail` at the start of the next
+            player's turn. */}
+        {edgeOccurrences.map((occ) => {
+          const octA = octagonById.get(occ.a)!;
+          const octB = octagonById.get(occ.b)!;
+          const geo = computeEdgeGeometry(octA, octB);
+          const { a: pA, b: pB } = slotPoints(geo, occ.occurrenceIndex, occ.total);
+          const pFrom = occ.from === occ.a ? pA : pB;
+          const pTo = occ.from === occ.a ? pB : pA;
+          const centerFrom = occ.from === occ.a ? octA.center : octB.center;
+          const centerTo = occ.from === occ.a ? octB.center : octA.center;
+          const path = [centerFrom, pFrom, pTo, centerTo];
+          const hueStart = hueAt(occ.hopIndex / totalHops);
+          const hueEnd = hueAt((occ.hopIndex + 1) / totalHops);
+          const gradId = `rr-edge-${occ.key}-occ${occ.occurrenceIndex}`;
+          return (
+            <g key={gradId}>
+              <linearGradient id={gradId} gradientUnits="userSpaceOnUse" x1={centerFrom.x} y1={centerFrom.y} x2={centerTo.x} y2={centerTo.y}>
+                {hueStops(hueStart, hueEnd).map((s, idx) => (
+                  <stop key={idx} offset={s.offset} stopColor={s.color} />
+                ))}
+              </linearGradient>
+              <polyline
+                points={pointsAttr(path)}
+                fill="none"
+                stroke={`url(#${gradId})`}
+                strokeWidth={0.16}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeOpacity={0.9}
+              />
+            </g>
+          );
+        })}
+
+        {/* The octagon nodes themselves — real polygon geometry, drawn AFTER the mesh lines above so
+            they paint on top: the thicker rim visually covers where multiple thin mesh lines
+            converge on this node's boundary, turning what would otherwise be several abrupt raw
+            line-endpoints into one clean, continuous-looking joint. Outline only by default; the
+            one that was just tapped (and is temporarily un-tappable again until a different dot is
+            chosen) fills in solid as the visual tie to that lock — no separate ripple popup needed.
+            The invisible tap buttons further below sit on top of these purely for hit-testing. */}
         {octagons.map((oct) => {
           const state = getDotState(oct.id);
           const isWrong = state === "wrong";
@@ -185,7 +310,7 @@ export default function DotRing({
             <polygon
               key={`oct-${oct.id}`}
               points={octagonPoints(oct)}
-              strokeWidth={0.5}
+              strokeWidth={0.8}
               style={{ fillOpacity: solid ? 1 : 0 }}
               className={
                 isWrong
@@ -196,64 +321,22 @@ export default function DotRing({
           );
         })}
 
-        {/* Every retracing of a connection gets its own line, parallel to every other line on that
-            same connection (guaranteed — see computeEdgeGeometry/slotPoints above), pushed further
-            toward the ring's outer edge the more recent it is. Each line's own color is its slice
-            of the single red -> violet spectrum the whole trail shares (see the comment up top) —
-            oriented in the actual direction it was tapped, so within one line it's already shifting
-            toward violet, and the very last line's arrival end is always exactly violet. A stable
-            key per historical occurrence (not per slot) means existing lines smoothly slide to
-            their new spatial offset as a connection's retrace count grows, via the inline CSS
-            transition below, independent of their color, which is recomputed fresh each render as
-            the spectrum keeps redividing. Driven entirely by `trail`, so it goes blank the instant
-            a screen clears `trail` at the start of the next player's turn. */}
-        {edgeOccurrences.map((occ) => {
-          const octA = octagonById.get(occ.a)!;
-          const octB = octagonById.get(occ.b)!;
-          const geo = computeEdgeGeometry(octA, octB);
-          const { a: pA, b: pB } = slotPoints(geo, occ.occurrenceIndex, occ.total);
-          const pFrom = occ.from === occ.a ? pA : pB;
-          const pTo = occ.from === occ.a ? pB : pA;
-          const hueStart = hueAt(occ.hopIndex / totalHops);
-          const hueEnd = hueAt((occ.hopIndex + 1) / totalHops);
-          const gradId = `rr-edge-${occ.key}-occ${occ.occurrenceIndex}`;
-          return (
-            <g key={gradId}>
-              <linearGradient id={gradId} gradientUnits="userSpaceOnUse" x1={pFrom.x} y1={pFrom.y} x2={pTo.x} y2={pTo.y}>
-                <stop offset="0%" stopColor={spectrumColor(hueStart)} />
-                <stop offset="100%" stopColor={spectrumColor(hueEnd)} />
-              </linearGradient>
-              <line
-                x1={pFrom.x}
-                y1={pFrom.y}
-                x2={pTo.x}
-                y2={pTo.y}
-                stroke={`url(#${gradId})`}
-                strokeWidth={0.35}
-                strokeLinecap="round"
-                strokeOpacity={0.9}
-                style={{ transition: "x1 300ms ease, y1 300ms ease, x2 300ms ease, y2 300ms ease" }}
-              />
-            </g>
-          );
-        })}
-
-        {/* The hop that was just tapped: draws from the previous slot point to the new one, then erases the same way.
-            Violet isn't a stand-in color here — the newest hop's arrival end is always exactly HUE_VIOLET by
-            construction (see hueAt above), so this matches the persistent line beneath it exactly. */}
-        {animatedFrom && animatedTo && (
+        {/* The hop that was just tapped: draws from the origin octagon's center out through the
+            bend and into the destination octagon's center, then erases the same way. Uses the SAME
+            hue range as the persistent path it's drawn on top of, so the animation reveals the true
+            rainbow rather than masking it — see AnimatedLine's hueStart/hueEnd comment for how
+            that's guaranteed. */}
+        {animatedPath && lastOccurrence && (
           <AnimatedLine
             key={`${last!.from}-${last!.to}-${trail.length}`}
-            from={animatedFrom}
-            to={animatedTo}
-            color={spectrumColor(HUE_VIOLET)}
+            path={animatedPath}
+            hueStart={hueAt(lastOccurrence.hopIndex / totalHops)}
+            hueEnd={hueAt((lastOccurrence.hopIndex + 1) / totalHops)}
           />
         )}
 
         {/* A failed tap stays drawn permanently (game-over state), no erase. */}
-        {wrongEdge && (
-          <AnimatedLine key="wrong" from={DOTS[wrongEdge.from]} to={DOTS[wrongEdge.to]} wrong persist />
-        )}
+        {wrongPath && <AnimatedLine key="wrong" path={wrongPath} wrong persist />}
       </svg>
 
       {DOTS.map((dot) => {
@@ -281,25 +364,29 @@ const HOLD_MS = 40;
 const ERASE_MS = 160;
 
 /**
- * Animates a directional hop from `from` to `to`:
- *  - draw phase: the tip grows from `from` toward `to` (0 -> 1)
- *  - erase phase: the tail retracts from `from` toward `to` (1 -> 2), same direction, so it
- *    visually "chases" itself off the board and disappears exactly at `to`.
+ * Animates travel along a bent `path` (see the comment above slotPoints for what that path is):
+ *  - draw phase: the tip travels from path[0] toward the far end (0 -> 1)
+ *  - erase phase: the tail retracts from path[0] toward the far end (1 -> 2), same direction, so it
+ *    visually "chases" itself off the board and disappears exactly at the far end.
  * Pass `persist` to stop after the draw phase and stay fully drawn (used for the game-over hop).
  */
 function AnimatedLine({
-  from,
-  to,
+  path,
   wrong = false,
   persist = false,
-  color,
+  hueStart,
+  hueEnd,
 }: {
-  from: { x: number; y: number };
-  to: { x: number; y: number };
+  path: Point[];
   wrong?: boolean;
   persist?: boolean;
-  /** Flat stroke color override (e.g. the current spectrum violet). Ignored when `wrong` is set. */
-  color?: string;
+  /** When provided (and not `wrong`), stroked with the real rainbow gradient for this hop instead
+   *  of a flat color — using path[0]/path[last] as FIXED gradient coordinates (not the currently
+   *  animating visible sub-path) means whatever partial portion is drawn mid-animation still
+   *  samples the correct slice of that fixed-in-space gradient, so it never disagrees with the
+   *  persistent path it's drawn on top of. */
+  hueStart?: number;
+  hueEnd?: number;
 }) {
   const [progress, setProgress] = useState(0); // 0 = not started, 1 = fully drawn, 2 = fully erased
 
@@ -339,42 +426,38 @@ function AnimatedLine({
 
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
+    // Runs once per mount — the parent always gives this component a fresh `key` for each new hop,
+    // so a remount (not a dependency change) is what restarts the animation.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [from.x, from.y, to.x, to.y, persist, wrong]);
+  }, []);
 
   if (progress >= 2) return null;
 
-  const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+  const visible = progress <= 1 ? subPath(path, 0, progress) : subPath(path, progress - 1, 1);
 
-  let x1 = from.x;
-  let y1 = from.y;
-  let x2: number;
-  let y2: number;
-
-  if (progress <= 1) {
-    // Draw phase: tip travels from `from` to `to`.
-    x2 = lerp(from.x, to.x, progress);
-    y2 = lerp(from.y, to.y, progress);
-  } else {
-    // Erase phase: tail travels from `from` to `to`, tip stays put at `to`.
-    const e = progress - 1;
-    x1 = lerp(from.x, to.x, e);
-    y1 = lerp(from.y, to.y, e);
-    x2 = to.x;
-    y2 = to.y;
-  }
+  const first = path[0];
+  const last = path[path.length - 1];
+  const gradId = !wrong && hueStart !== undefined && hueEnd !== undefined ? "rr-anim-grad" : null;
 
   return (
-    <line
-      x1={x1}
-      y1={y1}
-      x2={x2}
-      y2={y2}
-      strokeWidth={0.6}
-      strokeLinecap="round"
-      markerEnd={wrong ? "url(#rr-arrow-wrong)" : undefined}
-      style={color && !wrong ? { stroke: color } : undefined}
-      className={wrong ? "stroke-red-500" : color ? undefined : "stroke-black dark:stroke-white"}
-    />
+    <>
+      {gradId && (
+        <linearGradient id={gradId} gradientUnits="userSpaceOnUse" x1={first.x} y1={first.y} x2={last.x} y2={last.y}>
+          {hueStops(hueStart!, hueEnd!).map((s, idx) => (
+            <stop key={idx} offset={s.offset} stopColor={s.color} />
+          ))}
+        </linearGradient>
+      )}
+      <polyline
+        points={pointsAttr(visible)}
+        fill="none"
+        strokeWidth={0.45}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        markerEnd={wrong ? "url(#rr-arrow-wrong)" : undefined}
+        stroke={gradId ? `url(#${gradId})` : undefined}
+        className={wrong ? "stroke-red-500" : gradId ? undefined : "stroke-black dark:stroke-white"}
+      />
+    </>
   );
 }
