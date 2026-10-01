@@ -4,8 +4,12 @@ import { useState } from "react";
 import DotRing, { type DotState } from "../components/DotRing";
 
 /**
- * Self-contained sandbox for the octagon ring: tap dots to chain them
- * together, each tap animates a line in from the previously tapped dot.
+ * Self-contained sandbox for the ring: tap dots to chain them together, each
+ * tap animates a line in from the previously tapped dot. DotRing itself now
+ * blocks re-tapping an already-used dot for the rest of its ring, and once
+ * all 8 are used it recedes that ring's mesh into the background and starts
+ * a fresh one — this component doesn't need to know any of that happened,
+ * it just keeps appending whatever gets tapped to one long `chain`.
  * No turn/AI logic yet — just the core interaction.
  */
 export default function GameArea() {
@@ -15,8 +19,8 @@ export default function GameArea() {
     setChain((c) => [...c, id]);
   }
 
-  function getDotState(id: number): DotState {
-    return chain.includes(id) ? "used" : "available";
+  function getDotState(): DotState {
+    return "available";
   }
 
   return (
