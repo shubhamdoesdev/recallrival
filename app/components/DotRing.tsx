@@ -78,14 +78,11 @@ function meshScale(genIndex: number, activeGeneration: number): number {
 }
 
 /** Every mesh line — active ring or long-receded into the background — renders at this same
- *  opacity. Depth is already conveyed by scale (smaller, nearer the center) and blur (below); the
- *  color itself never fades, so the whole accumulated history keeps reading as one intact,
- *  continuously rainbow-colored trace rather than dimming the further back it sits. */
+ *  opacity, with no blur either. Depth is conveyed purely by scale (smaller, nearer the center);
+ *  the color itself stays completely constant and sharp at every depth, so the whole accumulated
+ *  history keeps reading as one intact, continuously rainbow-colored trace rather than fading or
+ *  washing out the further back it sits. */
 const MESH_OPACITY = 0.95;
-/** How much a fully-receded line blurs, in viewBox units — a soft depth-of-field cue reinforcing
- *  that it's sitting further back/down, on top of the scale and (flat) opacity already doing that
- *  job. Scales with how far a given line currently is from the active ring's own scale (1). */
-const MAX_RECEDE_BLUR = 0.35;
 
 // The whole game, first dot ever tapped to the latest one — across however many rings have come
 // and gone — is one continuous red -> violet spectrum. A ring completing and receding doesn't
@@ -194,7 +191,6 @@ export default function DotRing({
                 strokeLinecap="round"
                 style={{
                   opacity: MESH_OPACITY,
-                  filter: `blur(${(1 - avgScale) * MAX_RECEDE_BLUR}px)`,
                   transition: RECEDE_TRANSITION,
                 }}
               />
